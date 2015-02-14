@@ -1,6 +1,6 @@
 [class^="icon-"],
 [class*=" icon-"] {
-  @extend .fa
+  @extend .fa !optional;
 }
 
 .icon-glass              { @extend .fa-glass; }
