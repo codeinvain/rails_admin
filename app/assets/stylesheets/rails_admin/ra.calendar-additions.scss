@@ -35,10 +35,10 @@
 }
 .input-group {
   .hasTimepicker {
-    @extend .form-control;
+    @extend .form-control !optional;
     width: 65px !important;
   }
   .hasDatepicker {
-    @extend .form-control
+    @extend .form-control !optional;
   }
 }
