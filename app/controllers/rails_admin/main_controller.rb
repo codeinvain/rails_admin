@@ -1,368 +1,143 @@
 module RailsAdmin
   class MainController < RailsAdmin::ApplicationController
-    before_filter :get_model, :except => [:index]
-    before_filter :get_object, :only => [:edit, :update, :delete, :destroy]
-    before_filter :get_bulk_objects, :only => [:bulk_delete, :bulk_destroy]
-    before_filter :get_attributes, :only => [:create, :update]
-    before_filter :check_for_cancel, :only => [:create, :update, :destroy, :bulk_destroy]
+    include ActionView::Helpers::TextHelper
+    include RailsAdmin::MainHelper
+    include RailsAdmin::ApplicationHelper
 
-    def index
-      @authorization_adapter.authorize(:index) if @authorization_adapter
-      @page_name = t("admin.dashboard.pagename")
-      @page_type = "dashboard"
+    layout :get_layout
 
-      @history = AbstractHistory.history_latest_summaries
-      @month = DateTime.now.month
-      @year = DateTime.now.year
-      @history= AbstractHistory.history_for_month(@month, @year)
+    before_filter :get_model, except: RailsAdmin::Config::Actions.all(:root).collect(&:action_name)
+    before_filter :get_object, only: RailsAdmin::Config::Actions.all(:member).collect(&:action_name)
+    before_filter :check_for_cancel
 
-      @abstract_models = RailsAdmin::Config.visible_models.map(&:abstract_model)
+    RailsAdmin::Config::Actions.all.each do |action|
+      class_eval <<-EOS, __FILE__, __LINE__ + 1
+        def #{action.action_name}
+          action = RailsAdmin::Config::Actions.find('#{action.action_name}'.to_sym)
+          @authorization_adapter.try(:authorize, action.authorization_key, @abstract_model, @object)
+          @action = action.with({controller: self, abstract_model: @abstract_model, object: @object})
+          fail(ActionNotAllowed) unless @action.enabled?
+          @page_name = wording_for(:title)
 
-      @most_recent_changes = {}
-      @count = {}
-      @max = 0
-      @abstract_models.each do |t|
-        current_count = t.count
-        @max = current_count > @max ? current_count : @max
-        @count[t.pretty_name] = current_count
-        @most_recent_changes[t.pretty_name] = AbstractHistory.most_recent_history(t).limit(1).first.try(:updated_at)
-      end
-
-      render :layout => 'rails_admin/dashboard'
-    end
-
-    def list
-      @authorization_adapter.authorize(:list, @abstract_model) if @authorization_adapter
-      list_entries
-      visible = lambda { @model_config.list.visible_fields.map {|f| f.name } }
-      respond_to do |format|
-        format.html { render :layout => 'rails_admin/list' }
-        format.js { render :layout => 'rails_admin/plain.html.erb' }
-        format.json do
-          if params[:compact]
-            objects = []
-            @objects.each do |object|
-               objects << { :id => object.id, :label => @model_config.with(:object => object).object_label }
-            end
-            render :json => objects
-          else
-            render :json => @objects.to_json(:only => visible.call)
-          end
+          instance_eval &@action.controller
         end
-        format.xml { render :xml => @objects.to_json(:only => visible.call) }
+      EOS
+    end
+
+    def bulk_action
+      send(params[:bulk_action]) if params[:bulk_action].in?(RailsAdmin::Config::Actions.all(controller: self, abstract_model: @abstract_model).select(&:bulkable?).collect(&:route_fragment))
+    end
+
+    def list_entries(model_config = @model_config, auth_scope_key = :index, additional_scope = get_association_scope_from_params, pagination = !(params[:associated_collection] || params[:all] || params[:bulk_ids]))
+      scope = model_config.abstract_model.scoped
+      if auth_scope = @authorization_adapter && @authorization_adapter.query(auth_scope_key, model_config.abstract_model)
+        scope = scope.merge(auth_scope)
       end
+      scope = scope.instance_eval(&additional_scope) if additional_scope
+
+      get_collection(model_config, scope, pagination)
     end
 
-    def new
-      @object = @abstract_model.new
-      if @authorization_adapter
-        @authorization_adapter.attributes_for(:new, @abstract_model).each do |name, value|
-          @object.send("#{name}=", value)
-        end
-        @authorization_adapter.authorize(:new, @abstract_model, @object)
-      end
-      @page_name = t("admin.actions.create").capitalize + " " + @model_config.label.downcase
-      @page_type = @abstract_model.pretty_name.downcase
-      respond_to do |format|
-        format.html { render :layout => 'rails_admin/form' }
-        format.js   { render :layout => 'rails_admin/plain.html.erb' }
-      end
+  private
+
+    def get_layout
+      "rails_admin/#{request.headers['X-PJAX'] ? 'pjax' : 'application'}"
     end
 
-    def create
-      @modified_assoc = []
-      @object = @abstract_model.new
-      @model_config.create.fields.each {|f| f.parse_input(@attributes) if f.respond_to?(:parse_input) }
-      if @authorization_adapter
-        @authorization_adapter.attributes_for(:create, @abstract_model).each do |name, value|
-          @object.send("#{name}=", value)
-        end
-        @authorization_adapter.authorize(:create, @abstract_model, @object)
-      end
-      @object.attributes = @attributes
-      @page_name = t("admin.actions.create").capitalize + " " + @model_config.label.downcase
-      @page_type = @abstract_model.pretty_name.downcase
-
-      if @object.save
-        object_label = @model_config.with(:object => @object).object_label
-        AbstractHistory.create_history_item("Created #{object_label}", @object, @abstract_model, _current_user)
-        respond_to do |format|
-          format.html do
-            redirect_to_on_success
-          end
-          format.js do
-            render :json => {
-              :id => @object.id,
-              :label => object_label,
-            }
-          end
-        end
-      else
-        render_error
-      end
+    def back_or_index
+      params[:return_to].presence && params[:return_to].include?(request.host) && (params[:return_to] != request.fullpath) ? params[:return_to] : index_path
     end
 
-    def edit
-      @authorization_adapter.authorize(:edit, @abstract_model, @object) if @authorization_adapter
+    def get_sort_hash(model_config)
+      abstract_model = model_config.abstract_model
+      params[:sort] = params[:sort_reverse] = nil unless model_config.list.fields.collect { |f| f.name.to_s }.include? params[:sort]
 
-      @page_name = t("admin.actions.update").capitalize + " " + @model_config.label.downcase
-      @page_type = @abstract_model.pretty_name.downcase
+      params[:sort] ||= model_config.list.sort_by.to_s
+      params[:sort_reverse] ||= 'false'
 
-      render :layout => 'rails_admin/form'
-    end
+      field = model_config.list.fields.detect { |f| f.name.to_s == params[:sort] }
 
-    def update
-      @authorization_adapter.authorize(:update, @abstract_model, @object) if @authorization_adapter
-
-      @cached_assocations_hash = associations_hash
-      @modified_assoc = []
-
-      @page_name = t("admin.actions.update").capitalize + " " + @model_config.label.downcase
-      @page_type = @abstract_model.pretty_name.downcase
-
-      @old_object = @object.clone
-
-      @model_config.update.fields.each {|f| f.parse_input(@attributes) if f.respond_to?(:parse_input) }
-
-      @object.attributes = @attributes
-
-      if @object.save
-        AbstractHistory.create_update_history @abstract_model, @object, @cached_assocations_hash, associations_hash, @modified_assoc, @old_object, _current_user
-        redirect_to_on_success
-      else
-        render_error :edit
-      end
-    end
-
-    def delete
-      @authorization_adapter.authorize(:delete, @abstract_model, @object) if @authorization_adapter
-
-      @page_name = t("admin.actions.delete").capitalize + " " + @model_config.label.downcase
-      @page_type = @abstract_model.pretty_name.downcase
-
-      render :layout => 'rails_admin/delete'
-    end
-
-    def destroy
-      @authorization_adapter.authorize(:destroy, @abstract_model, @object) if @authorization_adapter
-
-      @object = @object.destroy
-      flash[:notice] = t("admin.delete.flash_confirmation", :name => @model_config.label)
-
-      AbstractHistory.create_history_item("Destroyed #{@model_config.with(:object => @object).object_label}", @object, @abstract_model, _current_user)
-
-      redirect_to rails_admin_list_path(:model_name => @abstract_model.to_param)
-    end
-
-    def bulk_delete
-      @authorization_adapter.authorize(:bulk_delete, @abstract_model) if @authorization_adapter
-
-      @page_name = t("admin.actions.delete").capitalize + " " + @model_config.label.downcase
-      @page_type = @abstract_model.pretty_name.downcase
-
-      render :layout => 'rails_admin/delete'
-    end
-
-    def bulk_destroy
-      @authorization_adapter.authorize(:bulk_destroy, @abstract_model) if @authorization_adapter
-
-      scope = @authorization_adapter && @authorization_adapter.query(params[:action].to_sym, @abstract_model)
-      @destroyed_objects = @abstract_model.destroy(params[:bulk_ids], scope)
-
-      @destroyed_objects.each do |object|
-        message = "Destroyed #{@model_config.with(:object => object).object_label}"
-        AbstractHistory.create_history_item(message, object, @abstract_model, _current_user)
-      end
-
-      redirect_to rails_admin_list_path(:model_name => @abstract_model.to_param)
-    end
-
-    def handle_error(e)
-      if RailsAdmin::AuthenticationNotConfigured === e
-        Rails.logger.error e.message
-        Rails.logger.error e.backtrace.join("\n")
-
-        @error = e
-        render 'authentication_not_setup', :status => 401
-      else
-        super
-      end
-    end
-
-    private
-
-    def get_bulk_objects
-      scope = @authorization_adapter && @authorization_adapter.query(params[:action].to_sym, @abstract_model)
-      @bulk_ids = params[:bulk_ids]
-      @bulk_objects = @abstract_model.get_bulk(@bulk_ids, scope)
-
-      not_found unless @bulk_objects
-    end
-
-    def get_sort_hash
-      sort = params[:sort] || RailsAdmin.config(@abstract_model).list.sort_by
-      {:sort => sort}
-    end
-
-    def get_sort_reverse_hash
-      sort_reverse = if params[:sort]
-          params[:sort_reverse] == 'true'
-      else
-        not RailsAdmin.config(@abstract_model).list.sort_reverse?
-      end
-      {:sort_reverse => sort_reverse}
-    end
-
-    def get_query_hash(options)
-      query = params[:query]
-      return {} unless query
-      field_search = !!query.index(":")
-      statements = []
-      values = []
-      conditions = options[:conditions] || [""]
-      table_name = @abstract_model.model.table_name
-      # field search allows a search of the type "<fieldname>:<query>"
-      if field_search
-        field, query = query.split ":"
-        return {} unless field && query
-        @properties.select{|property| property[:name] == field.to_sym}.each do |property|
-          statements << "(#{table_name}.#{property[:name]} = ?)"
-          values << query
-        end
-      # search over all string and text fields
-      else
-        @properties.select{|property| property[:type] == :string || property[:type] == :text }.each do |property|
-          statements << "(#{table_name}.#{property[:name]} LIKE ?)"
-          values << "%#{query}%"
+      column = begin
+        if field.nil? || field.sortable == true # use params[:sort] on the base table
+          "#{abstract_model.table_name}.#{params[:sort]}"
+        elsif field.sortable == false # use default sort, asked field is not sortable
+          "#{abstract_model.table_name}.#{model_config.list.sort_by}"
+        elsif (field.sortable.is_a?(String) || field.sortable.is_a?(Symbol)) && field.sortable.to_s.include?('.') # just provide sortable, don't do anything smart
+          field.sortable
+        elsif field.sortable.is_a?(Hash) # just join sortable hash, don't do anything smart
+          "#{field.sortable.keys.first}.#{field.sortable.values.first}"
+        elsif field.association? # use column on target table
+          "#{field.associated_model_config.abstract_model.table_name}.#{field.sortable}"
+        else # use described column in the field conf.
+          "#{abstract_model.table_name}.#{field.sortable}"
         end
       end
 
-      conditions[0] += " AND " unless conditions == [""]
-      conditions[0] += statements.join(" OR ")
-      conditions += values
-      conditions != [""] ? {:conditions => conditions} : {}
-    end
-
-    def get_filter_hash(options)
-      filter = params[:filter]
-      return {} unless filter
-      statements = []
-      values = []
-      conditions = options[:conditions] || [""]
-      table_name = @abstract_model.model.table_name
-
-      filter.each_pair do |key, value|
-        if field = @model_config.list.fields.find {|f| f.name == key.to_sym}
-          case field.type
-          when :string, :text
-            statements << "(#{table_name}.#{key} LIKE ?)"
-            values << value
-          when :boolean
-            statements << "(#{table_name}.#{key} = ?)"
-            values << (value == "true")
-          end
-        end
-      end
-
-      conditions[0] += " AND " unless conditions == [""]
-      conditions[0] += statements.join(" AND ")
-      conditions += values
-      conditions != [""] ? {:conditions => conditions} : {}
-    end
-
-    def get_attributes
-      @attributes = params[@abstract_model.to_param.singularize.gsub('~','_')] || {}
-      @attributes.each do |key, value|
-        # Deserialize the attribute if attribute is serialized
-        if @abstract_model.model.serialized_attributes.keys.include?(key) and value.is_a? String
-          @attributes[key] = YAML::load(value)
-        end
-        # Delete fields that are blank
-        @attributes[key] = nil if value.blank?
-      end
+      reversed_sort = (field ? field.sort_reverse? : model_config.list.sort_reverse?)
+      {sort: column, sort_reverse: (params[:sort_reverse] == reversed_sort.to_s)}
     end
 
     def redirect_to_on_success
-      param = @abstract_model.to_param
-      pretty_name = @model_config.label
-      action = params[:action]
-
+      notice = t('admin.flash.successful', name: @model_config.label, action: t("admin.actions.#{@action.key}.done"))
       if params[:_add_another]
-        flash[:notice] = t("admin.flash.successful", :name => pretty_name, :action => t("admin.actions.#{action}d"))
-        redirect_to rails_admin_new_path(:model_name => param)
+        redirect_to new_path(return_to: params[:return_to]), flash: {success: notice}
       elsif params[:_add_edit]
-        flash[:notice] = t("admin.flash.successful", :name => pretty_name, :action => t("admin.actions.#{action}d"))
-        redirect_to rails_admin_edit_path(:model_name => param, :id => @object.id)
+        redirect_to edit_path(id: @object.id, return_to: params[:return_to]), flash: {success: notice}
       else
-        flash[:notice] = t("admin.flash.successful", :name => pretty_name, :action => t("admin.actions.#{action}d"))
-        redirect_to rails_admin_list_path(:model_name => param)
+        redirect_to back_or_index, flash: {success: notice}
       end
     end
 
-    def render_error whereto = :new
-      action = params[:action]
+    def sanitize_params_for!(action, model_config = @model_config, target_params = params[@abstract_model.param_key])
+      return unless target_params.present?
+      fields = model_config.send(action).with(controller: self, view: view_context, object: @object).visible_fields
+      allowed_methods = fields.collect(&:allowed_methods).flatten.uniq.collect(&:to_s) << 'id' << '_destroy'
+      fields.each { |f| f.parse_input(target_params) }
+      target_params.slice!(*allowed_methods)
+      target_params.permit! if target_params.respond_to?(:permit!)
+      fields.select(&:nested_form).each do |association|
+        children_params = association.multiple? ? target_params[association.method_name].try(:values) : [target_params[association.method_name]].compact
+        (children_params || []).each do |children_param|
+          sanitize_params_for!(:nested, association.associated_model_config, children_param)
+        end
+      end
+    end
 
-      flash.now[:error] = t("admin.flash.error", :name => @model_config.label, :action => t("admin.actions.#{action}d"))
-      flash.now[:error] += ". #{@object.errors[:base].to_sentence}" unless @object.errors[:base].blank?
-      
+    def handle_save_error(whereto = :new)
+      flash.now[:error] = t('admin.flash.error', name: @model_config.label, action: t("admin.actions.#{@action.key}.done").html_safe).html_safe
+      flash.now[:error] += %(<br>- #{@object.errors.full_messages.join('<br>- ')}).html_safe
+
       respond_to do |format|
-        format.html { render whereto, :layout => 'rails_admin/form', :status => :not_acceptable }
-        format.js   { render whereto, :layout => 'rails_admin/plain.html.erb', :status => :not_acceptable  }
+        format.html { render whereto, status: :not_acceptable }
+        format.js   { render whereto, layout: false, status: :not_acceptable  }
       end
     end
 
     def check_for_cancel
-      if params[:_continue]
-        flash[:notice] = t("admin.flash.noaction")
-        redirect_to rails_admin_list_path(:model_name => @abstract_model.to_param)
-      end
+      return unless params[:_continue] || (params[:bulk_action] && !params[:bulk_ids])
+      redirect_to(back_or_index, flash: {info: t('admin.flash.noaction')})
     end
 
-    def list_entries(other = {})
+    def get_collection(model_config, scope, pagination)
+      associations = model_config.list.fields.select { |f| f.type == :belongs_to_association && !f.polymorphic? }.collect { |f| f.association.name }
       options = {}
-      options.merge!(get_sort_hash)
-      options.merge!(get_sort_reverse_hash)
-      options.merge!(get_query_hash(options))
-      options.merge!(get_filter_hash(options))
-      per_page = @model_config.list.items_per_page
-
-      scope = @authorization_adapter && @authorization_adapter.query(:list, @abstract_model)
-
-      # external filter
-      options.merge!(other)
-
-      associations = @model_config.list.visible_fields.select {|f| f.association? && !f.polymorphic? }.map {|f| f.association[:name] }
-      options.merge!(:include => associations) unless associations.empty?
-
-      if params[:all]
-        options.merge!(:limit => per_page * 2)
-        @objects = @abstract_model.all(options, scope).reverse
-      else
-        @current_page = (params[:page] || 1).to_i
-        options.merge!(:page => @current_page, :per_page => per_page)
-        @page_count, @objects = @abstract_model.paginated(options, scope)
-        options.delete(:page)
-        options.delete(:per_page)
-        options.delete(:offset)
-        options.delete(:limit)
-      end
-
-      @record_count = @abstract_model.count(options, scope)
-
-      @page_type = @abstract_model.pretty_name.downcase
-      @page_name = t("admin.list.select", :name => @model_config.label.downcase)
+      options = options.merge(page: (params[Kaminari.config.param_name] || 1).to_i, per: (params[:per] || model_config.list.items_per_page)) if pagination
+      options = options.merge(include: associations) unless associations.blank?
+      options = options.merge(get_sort_hash(model_config))
+      options = options.merge(query: params[:query]) if params[:query].present?
+      options = options.merge(filters: params[:f]) if params[:f].present?
+      options = options.merge(bulk_ids: params[:bulk_ids]) if params[:bulk_ids]
+      model_config.abstract_model.all(options, scope)
     end
 
-    def associations_hash
-      associations = {}
-      @abstract_model.associations.each do |association|
-        if [:has_many, :has_and_belongs_to_many].include?(association[:type])
-          records = Array(@object.send(association[:name]))
-          associations[association[:name]] = records.collect(&:id)
-        end
-      end
-      associations
+    def get_association_scope_from_params
+      return nil unless params[:associated_collection].present?
+      source_abstract_model = RailsAdmin::AbstractModel.new(to_model_name(params[:source_abstract_model]))
+      source_model_config = source_abstract_model.config
+      source_object = source_abstract_model.get(params[:source_object_id])
+      action = params[:current_action].in?(%w(create update)) ? params[:current_action] : 'edit'
+      @association = source_model_config.send(action).fields.detect { |f| f.name == params[:associated_collection].to_sym }.with(controller: self, object: source_object)
+      @association.associated_collection_scope
     end
-
   end
 end

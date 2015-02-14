@@ -2,195 +2,163 @@ require 'rails_admin/i18n_support'
 
 module RailsAdmin
   module ApplicationHelper
-
     include RailsAdmin::I18nSupport
 
-    def head_javascript(path = nil, &block)
-      if block
-        (@head_javascript ||= []) << capture(&block)
-      elsif path
-        (@head_javascript_paths ||= []) << path
+    def capitalize_first_letter(wording)
+      return nil unless wording.present? && wording.is_a?(String)
+
+      wording = wording.dup
+      wording[0] = wording[0].mb_chars.capitalize.to_s
+      wording
+    end
+
+    def authorized?(action_name, abstract_model = nil, object = nil)
+      object = nil if object.try :new_record?
+      action(action_name, abstract_model, object).try(:authorized?)
+    end
+
+    def current_action?(action, abstract_model = @abstract_model, object = @object)
+      @action.custom_key == action.custom_key &&
+        abstract_model.try(:to_param) == @abstract_model.try(:to_param) &&
+        (@object.try(:persisted?) ? @object.id == object.try(:id) : !object.try(:persisted?))
+    end
+
+    def action(key, abstract_model = nil, object = nil)
+      RailsAdmin::Config::Actions.find(key, controller: controller, abstract_model: abstract_model, object: object)
+    end
+
+    def actions(scope = :all, abstract_model = nil, object = nil)
+      RailsAdmin::Config::Actions.all(scope, controller: controller, abstract_model: abstract_model, object: object)
+    end
+
+    def edit_user_link
+      return nil unless abstract_model = RailsAdmin.config(_current_user.class).abstract_model
+      return nil unless (edit_action = RailsAdmin::Config::Actions.find(:edit, controller: controller, abstract_model: abstract_model, object: _current_user)).try(:authorized?)
+      link_to _current_user.email, url_for(action: edit_action.action_name, model_name: abstract_model.to_param, id: _current_user.id, controller: 'rails_admin/main')
+    end
+
+    def logout_path
+      if defined?(Devise)
+        scope = Devise::Mapping.find_scope!(_current_user)
+        main_app.send("destroy_#{scope}_session_path") rescue false
       else
-        html = ""
-        if paths = @head_javascript_paths
-          html << javascript_include_tag(paths.uniq)
-        end
-        if script = @head_javascript
-          html << javascript_tag(script.join("\n"))
-        end
-        return html.html_safe
+        main_app.logout_path if main_app.respond_to?(:logout_path)
       end
     end
 
-    def head_style(path = nil, &block)
-      if block
-        (@head_style ||= []) << capture(&block)
-      elsif path
-        (@head_stylesheet_paths ||= []) << path
-      else
-        html = ""
-        if paths = @head_stylesheet_paths
-          html << stylesheet_link_tag(paths.uniq)
+    def logout_method
+      return [Devise.sign_out_via].flatten.first if defined?(Devise)
+      :delete
+    end
+
+    def wording_for(label, action = @action, abstract_model = @abstract_model, object = @object)
+      model_config = abstract_model.try(:config)
+      object = abstract_model && object.is_a?(abstract_model.model) ? object : nil
+      action = RailsAdmin::Config::Actions.find(action.to_sym) if action.is_a?(Symbol) || action.is_a?(String)
+
+      capitalize_first_letter I18n.t(
+        "admin.actions.#{action.i18n_key}.#{label}",
+        model_label: model_config && model_config.label,
+        model_label_plural: model_config && model_config.label_plural,
+        object_label: model_config && object.try(model_config.object_label_method),
+      )
+    end
+
+    def main_navigation
+      nodes_stack = RailsAdmin::Config.visible_models(controller: controller)
+      node_model_names = nodes_stack.collect { |c| c.abstract_model.model_name }
+
+      nodes_stack.group_by(&:navigation_label).collect do |navigation_label, nodes|
+        nodes = nodes.select { |n| n.parent.nil? || !n.parent.to_s.in?(node_model_names) }
+        li_stack = navigation nodes_stack, nodes
+
+        label = navigation_label || t('admin.misc.navigation')
+
+        %(<li class='dropdown-header'>#{capitalize_first_letter label}</li>#{li_stack}) if li_stack.present?
+      end.join.html_safe
+    end
+
+    def static_navigation
+      li_stack = RailsAdmin::Config.navigation_static_links.collect do |title, url|
+        content_tag(:li, link_to(title.to_s, url, target: '_blank'))
+      end.join
+
+      label = RailsAdmin::Config.navigation_static_label || t('admin.misc.navigation_static_label')
+      li_stack = %(<li class='nav-header'>#{label}</li>#{li_stack}).html_safe if li_stack.present?
+      li_stack
+    end
+
+    def navigation(nodes_stack, nodes, level = 0)
+      nodes.collect do |node|
+        model_param = node.abstract_model.to_param
+        url         = url_for(action: :index, controller: 'rails_admin/main', model_name: model_param)
+        level_class = " nav-level-#{level}" if level > 0
+        nav_icon = node.navigation_icon ? %(<i class="#{node.navigation_icon}"></i>).html_safe : ''
+        li = content_tag :li, 'data-model' => model_param do
+          link_to nav_icon + capitalize_first_letter(node.label_plural), url, class: "pjax#{level_class}"
         end
-        if style = @head_style
-          html << content_tag(:style, style.join("\n"), :type => "text/css")
-        end
-        return html.html_safe
-      end
+        li + navigation(nodes_stack, nodes_stack.select { |n| n.parent.to_s == node.abstract_model.model_name }, level + 1)
+      end.join.html_safe
     end
 
-    # A Helper to load from a CDN but with fallbacks in case the primary source is unavailable
-    # The best of both worlds - fast clevery cached service from google when available and the
-    # ability to work offline too.
-    #
-    # @example Loading jquery from google
-    #   javascript_fallback "http://ajax.googleapis.com/ajax/libs/jquery/1.4.3/jquery.min.js",
-    #     "/javascripts/jquery-1.4.3.min.js",
-    #     "typeof jQuery == 'undefined'"
-    # @param [String] primary a string to be passed to javascript_include_tag that represents the primary source e.g. A script on googles CDN.
-    # @param [String] fallback a path to the secondary javascript file that is (hopefully) more resilliant than the primary.
-    # @param [String] test a test written in javascript that evaluates to true if it is necessary to load the fallback javascript.
-    # @reurns [String] the resulting html to be inserted into your page.
-    def javascript_fallback(primary, fallback, test)
-      html = javascript_include_tag( primary )
-      html << "\n" << content_tag(:script, :type => "text/javascript") do
-        %Q{
-          if (#{test}) {
-            document.write(unescape("%3Cscript src='#{fallback}' type='text/javascript'%3E%3C/script%3E"));
-          }
-        }.gsub(/^ {8}/, '').html_safe
-      end
-      html+"\n"
-    end
-
-    def history_output(t)
-      if not t.message.downcase.rindex("changed").nil?
-        return t.message.downcase + " for #{t.table.capitalize} ##{t.item}"
-      else
-        return t.message.downcase
-      end
-    end
-
-    # Given a page count and the current page, we generate a set of pagination
-    # links.
-    #
-    # * We use an inner and outer window into a list of links. For a set of
-    # 20 pages with the current page being 10:
-    # outer_window:
-    #   1 2 ..... 19 20
-    # inner_window
-    #   5 6 7 8 9 10 11 12 13 14
-    #
-    # This is totally adjustable, or can be turned off by giving the
-    # :inner_window setting a value of nil.
-    #
-    # * Options
-    # :left_cut_label => <em>text_for_cut</em>::
-    #    Used when the page numbers need to be cut off to prevent the set of
-    #    pagination links from being too long.
-    #    Defaults to '&hellip;'
-    # :right_cut_label => <em>text_for_cut</em>::
-    #    Same as :left_cut_label but for the right side of numbers.
-    #    Defaults to '&hellip;'
-    # :outer_window => <em>number_of_pages</em>::
-    #    Sets the number of pages to include in the outer 'window'
-    #    Defaults to 2
-    # :inner_window => <em>number_of_pages</em>::
-    #    Sets the number of pags to include in the inner 'window'
-    #    Defaults to 7
-    # :page_param => <em>name_of_page_paramiter</em>
-    #    Sets the name of the paramiter the paginator uses to return what
-    #    page is being requested.
-    #    Defaults to 'page'
-    # :url => <em>url_for_links</em>
-    #    Provides the base url to use in the page navigation links.
-    #    Defaults to ''
-    def paginate(current_page, page_count, options = {})
-      options[:left_cut_label] ||= '&hellip;'
-      options[:right_cut_label] ||= '&hellip;'
-      options[:outer_window] ||= 2
-      options[:inner_window] ||= 7
-      options[:page_param] ||= 'page'
-      options[:url] ||= ""
-
-      url = options.delete(:url)
-      url.delete(options[:page_param])
-      url = url.to_a.collect{|x| x.join("=")}.join("&")
-
-      url += (url.include?('=') ? '&' : '') + options[:page_param]
-      url = "?"+url
-
-      pages = {
-        :all => (1..page_count).to_a,
-        :left => [],
-        :center => [],
-        :right => []
-      }
-
-      infinity = (1/0.0)
-
-      # Only worry about using our 'windows' if the page count is less then
-      # our windows combined.
-      if options[:inner_window].nil? || ((options[:outer_window] * 2) + options[:inner_window] + 2) >= page_count
-        pages[:center] = pages[:all]
-      else
-        pages[:left] = pages[:all][0, options[:outer_window]]
-        pages[:right] = pages[:all][page_count - options[:outer_window], options[:outer_window]]
-        pages[:center] = case current_page
-        # allow the inner 'window' to shift to right when close to the left edge
-        # Ex: 1 2 [3] 4 5 6 7 8 9 ... 20
-        when -infinity .. (options[:inner_window] / 2) + 3
-          pages[:all][options[:outer_window], options[:inner_window]] +
-            [options[:right_cut_label]]
-        # allow the inner 'window' to shift left when close to the right edge
-        # Ex: 1 2 ... 12 13 14 15 16 [17] 18 19 20
-        when (page_count - (options[:inner_window] / 2.0).ceil) - 1 .. infinity
-          [options[:left_cut_label]] +
-            pages[:all][page_count - options[:inner_window] - options[:outer_window], options[:inner_window]]
-        # Display the unshifed window
-        # ex: 1 2 ... 5 6 7 [8] 9 10 11 ... 19 20
-        else
-          [options[:left_cut_label]] +
-            pages[:all][current_page - (options[:inner_window] / 2) - 1, options[:inner_window]] +
-            [options[:right_cut_label]]
-        end
-      end
-
-      b = []
-
-      [pages[:left], pages[:center], pages[:right]].each do |p|
-        p.each do |page_number|
-
-          case page_number
-          when String
-            b << page_number
-          when current_page
-            b << Builder::XmlMarkup.new.span(page_number, :class => "this-page")
-          when page_count
-            b << link_to(page_number, "#{url}=#{page_number}", :class => "end", :remote => true)
-          else
-            b << link_to(page_number, "#{url}=#{page_number}", :remote => true)
-          end
-        end
-      end
-
-      b.join(" ")
-    end
-
-    def authorized?(*args)
-      @authorization_adapter.nil? || @authorization_adapter.authorized?(*args)
-    end
-
-    # returns a link to "/" unless there's a problem, which will
-    # probably be caused by root_path not being configured.  see
-    # https://github.com/sferik/rails_admin/issues/345 .
-    def home_link
+    def breadcrumb(action = @action, _acc = [])
       begin
-        link_to(t('home.name'), '/')
-      rescue ActionView::Template::Error
-        t('home.name')
+        (parent_actions ||= []) << action
+      end while action.breadcrumb_parent && (action = action(*action.breadcrumb_parent)) # rubocop:disable Loop
+
+      content_tag(:ol, class: 'breadcrumb') do
+        parent_actions.collect do |a|
+          am = a.send(:eval, 'bindings[:abstract_model]')
+          o = a.send(:eval, 'bindings[:object]')
+          content_tag(:li, class: current_action?(a, am, o) && 'active') do
+            crumb = begin
+              if !current_action?(a, am, o)
+                if a.http_methods.include?(:get)
+                  link_to url_for(action: a.action_name, controller: 'rails_admin/main', model_name: am.try(:to_param), id: (o.try(:persisted?) && o.try(:id) || nil)), class: 'pjax' do
+                    wording_for(:breadcrumb, a, am, o)
+                  end
+                else
+                  content_tag(:span, wording_for(:breadcrumb, a, am, o))
+                end
+              else
+                wording_for(:breadcrumb, a, am, o)
+              end
+            end
+            crumb
+          end
+        end.reverse.join.html_safe
       end
     end
 
+    # parent => :root, :collection, :member
+    def menu_for(parent, abstract_model = nil, object = nil, only_icon = false) # perf matters here (no action view trickery)
+      actions = actions(parent, abstract_model, object).select { |a| a.http_methods.include?(:get) }
+      actions.collect do |action|
+        wording = wording_for(:menu, action)
+        %(
+          <li title="#{wording if only_icon}" rel="#{'tooltip' if only_icon}" class="icon #{action.key}_#{parent}_link #{'active' if current_action?(action)}">
+            <a class="#{action.pjax? ? 'pjax' : ''}" href="#{url_for(action: action.action_name, controller: 'rails_admin/main', model_name: abstract_model.try(:to_param), id: (object.try(:persisted?) && object.try(:id) || nil))}">
+              <i class="#{action.link_icon}"></i>
+              <span#{only_icon ? " style='display:none'" : ''}>#{wording}</span>
+            </a>
+          </li>
+        )
+      end.join.html_safe
+    end
+
+    def bulk_menu(abstract_model = @abstract_model)
+      actions = actions(:bulkable, abstract_model)
+      return '' if actions.empty?
+      content_tag :li, class: 'dropdown', style: 'float:right' do
+        content_tag(:a, class: 'dropdown-toggle', :'data-toggle' => 'dropdown', href: '#') { t('admin.misc.bulk_menu_title').html_safe + '<b class="caret"></b>'.html_safe } +
+          content_tag(:ul, class: 'dropdown-menu', style: 'left:auto; right:0;') do
+            actions.collect do |action|
+              content_tag :li do
+                link_to wording_for(:bulk_link, action), '#', onclick: "jQuery('#bulk_action').val('#{action.action_name}'); jQuery('#bulk_form').submit(); return false;"
+              end
+            end.join.html_safe
+          end
+      end.html_safe
+    end
   end
 end

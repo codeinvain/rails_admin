@@ -5,55 +5,42 @@ module RailsAdmin
     module Fields
       module Types
         class BelongsToAssociation < RailsAdmin::Config::Fields::Association
-          # Register field type for the type loader
-          RailsAdmin::Config::Fields::Types::register(self)
+          RailsAdmin::Config::Fields::Types.register(self)
 
-          attr_reader :association
-
-          def initialize(parent, name, properties, association)
-            super(parent, name, properties)
-            @association = association
+          register_instance_option :formatted_value do
+            (o = value) && o.send(associated_model_config.object_label_method)
           end
 
-          # Accessor for field's formatted value
-          register_instance_option(:formatted_value) do
-            object = bindings[:object].send(association[:name])
-            unless object.nil?
-              RailsAdmin::Config.model(object).with(:object => object).object_label
-            else
-              nil
-            end
+          register_instance_option :sortable do
+            @sortable ||= abstract_model.adapter_supports_joins? && associated_model_config.abstract_model.properties.collect(&:name).include?(associated_model_config.object_label_method) ? associated_model_config.object_label_method : {abstract_model.table_name => method_name}
           end
 
-          register_instance_option(:partial) do
-            :form_filtering_select
+          register_instance_option :searchable do
+            @searchable ||= associated_model_config.abstract_model.properties.collect(&:name).include?(associated_model_config.object_label_method) ? [associated_model_config.object_label_method, {abstract_model.model => method_name}] : {abstract_model.model => method_name}
           end
 
-          register_instance_option(:render) do
-            bindings[:view].render :partial => partial.to_s, :locals => {:field => self, :form => bindings[:form] }
+          register_instance_option :partial do
+            nested_form ? :form_nested_one : :form_filtering_select
           end
 
-          def associated_collection
-            associated_model_config.abstract_model.all.map do |object|
-              [associated_model_config.with(:object => object).object_label, object.id]
-            end
+          register_instance_option :inline_add do
+            true
           end
 
-          def associated_model_config
-            @associated_model_config ||= RailsAdmin.config(association[:parent_model])
+          register_instance_option :inline_edit do
+            true
           end
 
           def selected_id
-            bindings[:object].send(child_key)
+            bindings[:object].send(foreign_key)
           end
 
-          # Reader for field's value
-          def value
-            bindings[:object].send(name)
-          end
-          
           def method_name
-            name.to_s
+            nested_form ? "#{name}_attributes".to_sym : association.foreign_key
+          end
+
+          def multiple?
+            false
           end
         end
       end
